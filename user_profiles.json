@@ -1,0 +1,26 @@
+{
+    "913629323": {
+        "height": 184.0
+    },
+    "5527645875": {
+        "age": 19,
+        "gender": "male",
+        "weight": 73.0,
+        "height": 184.0,
+        "fitness_goal": "endurance"
+    },
+    "1040635245": {
+        "age": 22,
+        "gender": "male",
+        "weight": 60.0,
+        "height": 183.0,
+        "fitness_goal": "muscle gain"
+    },
+    "8095272532": {
+        "age": 19,
+        "gender": "female",
+        "weight": 78.0,
+        "height": 196.0,
+        "fitness_goal": "weight loss"
+    }
+}
