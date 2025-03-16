@@ -5,47 +5,36 @@ import openai
 from telegram import Update
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
                           ConversationHandler, filters, ContextTypes)
+from pymongo import MongoClient
+import signal
+import asyncio
+import threading
 
 load_dotenv()
 
 # Настройки OpenAI GPT
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+MONGO_DB_URI = os.getenv("MONGO_DB_URI")
 
 # Этапы диалога
-(START, AGE, GENDER, WEIGHT, HEIGHT, FITNESS_GOAL, FITNESS_LEVEL) = range(7)
-
+(START, NAME, AGE, GENDER, WEIGHT, HEIGHT, FITNESS_GOAL, FITNESS_LEVEL) = range(8)
 
 class UserProfileManager:
-    USER_DATA_FILE = 'user_profiles.json'
-
-    @classmethod
-    def ensure_file_exists(cls):
-        if not os.path.exists(cls.USER_DATA_FILE):
-            with open(cls.USER_DATA_FILE, 'w') as f:
-                json.dump({}, f)
+    client = MongoClient(MONGO_DB_URI)
+    db = client['fitness_bot']
+    collection = db['user_profiles']
 
     @classmethod
     def save_user_profile(cls, user_id, profile_data):
-        cls.ensure_file_exists()
-        with open(cls.USER_DATA_FILE, 'r') as f:
-            try:
-                users = json.load(f)
-            except json.JSONDecodeError:
-                users = {}
-        users[str(user_id)] = dict(profile_data)
-        with open(cls.USER_DATA_FILE, 'w') as f:
-            json.dump(users, f, indent=4)
+        cls.collection.update_one(
+            {"user_id": user_id},
+            {"$set": profile_data},
+            upsert=True
+        )
 
     @classmethod
     def get_user_profile(cls, user_id):
-        cls.ensure_file_exists()
-        with open(cls.USER_DATA_FILE, 'r') as f:
-            try:
-                users = json.load(f)
-                return users.get(str(user_id))
-            except json.JSONDecodeError:
-                return None
-
+        return cls.collection.find_one({"user_id": user_id}, {"_id": 0, "user_id": 0})
 
 class AIAssistant:
     def __init__(self):
@@ -66,7 +55,6 @@ class AIAssistant:
         except Exception as e:
             return f"Error: {str(e)}"
 
-
 class FitnessAssistantBot:
     def __init__(self, telegram_token):
         self.application = ApplicationBuilder().token(telegram_token).build()
@@ -77,6 +65,7 @@ class FitnessAssistantBot:
         conv_handler = ConversationHandler(
             entry_points=[CommandHandler('start', self.start_profile_creation)],
             states={
+                NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_name)],
                 AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_age)],
                 GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_gender)],
                 WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_weight)],
@@ -92,9 +81,13 @@ class FitnessAssistantBot:
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_ai_query))
 
     async def start_profile_creation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Welcome! How old are you?")
-        return AGE
+        await update.message.reply_text("Welcome! What is your name?")
+        return NAME
 
+    async def collect_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data['name'] = update.message.text
+        await update.message.reply_text("How old are you?")
+        return AGE
 
     async def handle_ai_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_profile = UserProfileManager.get_user_profile(update.effective_user.id)
@@ -103,8 +96,6 @@ class FitnessAssistantBot:
             return
         response = self.ai_assistant.generate_fitness_plan(user_profile, update.message.text)
         await update.message.reply_text(response)
-
-
 
     async def collect_age(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -125,7 +116,6 @@ class FitnessAssistantBot:
             await update.message.reply_text(f"Your Profile:\n{profile_text}")
         else:
             await update.message.reply_text("No profile found. Use /start to create one.")
-
 
     async def collect_gender(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         gender = update.message.text.lower()
@@ -182,15 +172,18 @@ class FitnessAssistantBot:
         await update.message.reply_text("Profile saved! Use /plan to get a personalized fitness plan.")
         return ConversationHandler.END
 
-
     async def cancel_profile_creation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Профиль не был сохранён. Введите /start, чтобы начать заново.")
         return ConversationHandler.END
 
-
     def run(self):
         self.application.run_polling()
 
+    def stop(self):
+        self.application.stop_polling()
 
 if __name__ == '__main__':
-    FitnessAssistantBot(os.getenv("TELEGRAM_API_TOKEN")).run()
+    telegram_token = os.getenv("TELEGRAM_API_TOKEN")
+    print("Fitness Assistant Bot") 
+    FitnessAssistantBot(telegram_token).run()
+    
