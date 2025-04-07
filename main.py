@@ -3,6 +3,8 @@ import json
 from dotenv import load_dotenv
 import openai
 from telegram import Update
+import joblib
+import pandas as pd
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
                           ConversationHandler, filters, ContextTypes)
 from pymongo import MongoClient
@@ -10,6 +12,9 @@ import signal
 import asyncio
 import threading
 
+
+# Загрузка модели
+progress_model = joblib.load("progress_predictor_extended.pkl")
 load_dotenv()
 
 # Настройки OpenAI GPT
@@ -17,7 +22,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MONGO_DB_URI = os.getenv("MONGO_DB_URI")
 
 # Этапы диалога
-(START, NAME, AGE, GENDER, WEIGHT, HEIGHT, FITNESS_GOAL, FITNESS_LEVEL) = range(8)
+(START, NAME, AGE, GENDER, WEIGHT, HEIGHT, FITNESS_GOAL, FITNESS_LEVEL, IMPROVE_REQUEST, EDIT_PLAN) = range(10)
+(PREDICT_SESSIONS, PREDICT_DURATION, PREDICT_SLEEP, PREDICT_DIET, PREDICT_BREAKS, PREDICT_CONSISTENCY) = range(100, 106)
+
 
 class UserProfileManager:
     client = MongoClient(MONGO_DB_URI)
@@ -35,12 +42,28 @@ class UserProfileManager:
     @classmethod
     def get_user_profile(cls, user_id):
         return cls.collection.find_one({"user_id": user_id}, {"_id": 0, "user_id": 0})
+    
+    @classmethod
+    def save_user_plan(cls, user_id, plan):
+        cls.collection.update_one(
+            {"user_id": user_id},
+            {"$set": {"last_plan": plan}},
+            upsert=True
+        )
+    
+    @classmethod
+    def delete_user_plan(cls, user_id):
+        cls.collection.update_one(
+            {"user_id": user_id},
+            {"$unset": {"last_plan": ""}}
+        )
+
 
 class AIAssistant:
     def __init__(self):
         self.api_key = OPENAI_API_KEY
 
-    def generate_fitness_plan(self, user_profile):
+    def generate_fitness_plan(self, user_profile, ):
         prompt = (
             f"User Profile: {json.dumps(user_profile)}\n\n"
              "Generate a personalized workout plan based on the user's profile, fitness goal, and fitness level. for next 7 days only PLAN nothing else. and dont exceed limit  answer more than 200 words."
@@ -71,14 +94,32 @@ class FitnessAssistantBot:
                 WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_weight)],
                 HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_height)],
                 FITNESS_GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_fitness_goal)],
-                FITNESS_LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.finish_profile_creation)]
+                FITNESS_LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_fitness_level)]
             },
             fallbacks=[CommandHandler('cancel', self.cancel_profile_creation)]
         )
+        predict_conv = ConversationHandler(
+    entry_points=[CommandHandler("predict", self.predict_entry)],
+    states={
+        PREDICT_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_sessions)],
+        PREDICT_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_duration)],
+        PREDICT_SLEEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_sleep)],
+        PREDICT_DIET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_diet)],
+        PREDICT_BREAKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_breaks)],
+        PREDICT_CONSISTENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_consistency)],
+    },
+    fallbacks=[CommandHandler("cancel", self.cancel_profile_creation)],
+)
+        self.application.add_handler(predict_conv)
         self.application.add_handler(conv_handler)
         self.application.add_handler(CommandHandler('profile', self.show_profile))
         self.application.add_handler(CommandHandler('plan', self.get_fitness_plan))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_ai_query))
+        self.application.add_handler(CommandHandler('improve', self.improve_plan))
+        self.application.add_handler(CommandHandler('deleteplan', self.delete_plan))
+        conv_handler.states[IMPROVE_REQUEST] = [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_improvement)]
+        
+
 
     async def start_profile_creation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Welcome! What is your name?")
@@ -94,7 +135,7 @@ class FitnessAssistantBot:
         if not user_profile:
             await update.message.reply_text("Create a profile first using /start.")
             return
-        response = self.ai_assistant.generate_fitness_plan(user_profile, update.message.text)
+        response = self.ai_assistant.generate_fitness_plan(user_profile)
         await update.message.reply_text(response)
 
     async def collect_age(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -112,7 +153,12 @@ class FitnessAssistantBot:
     async def show_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         profile = UserProfileManager.get_user_profile(update.effective_user.id)
         if profile:
-            profile_text = "\n".join(f"{k.title()}: {v}" for k, v in profile.items())
+            profile_text = "\n".join(
+                f"{k.title().replace('_', ' ')}: {v}" for k, v in profile.items() if k != "last_plan"
+            )
+            plan = profile.get("last_plan")
+            if plan:
+                profile_text += f"\n\n📋 Your Plan:\n{plan}"
             await update.message.reply_text(f"Your Profile:\n{profile_text}")
         else:
             await update.message.reply_text("No profile found. Use /start to create one.")
@@ -149,6 +195,17 @@ class FitnessAssistantBot:
             pass
         await update.message.reply_text("Enter a valid height (100-250 cm).")
         return HEIGHT
+    
+    async def collect_fitness_level(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        level = update.message.text.lower()
+        if level in ["beginner", "intermediate", "advanced"]:
+            context.user_data["fitness_level"] = level
+            UserProfileManager.save_user_profile(update.effective_user.id, context.user_data)
+            await update.message.reply_text(" Profile saved! Use /plan to get your personalized plan.")
+            return ConversationHandler.END
+        await update.message.reply_text("Please choose: Beginner, Intermediate or Advanced.")
+        return FITNESS_LEVEL
+
 
     async def collect_fitness_goal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         goal = update.message.text.lower()
@@ -164,8 +221,123 @@ class FitnessAssistantBot:
         if not profile:
             await update.message.reply_text("No profile found. Use /start to create one.")
             return
+        if "last_plan" in profile:
+            await update.message.reply_text(
+                "You already have a fitness plan.\nUse /improve to enhance it or /resetplan to start over."
+            )
+            return
         plan = self.ai_assistant.generate_fitness_plan(profile)
+        UserProfileManager.save_user_plan(update.effective_user.id, plan)
         await update.message.reply_text(f"Your Fitness Plan:\n{plan}")
+
+
+    async def improve_plan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        profile = UserProfileManager.get_user_profile(update.effective_user.id)
+        if not profile or "last_plan" not in profile:
+            await update.message.reply_text("You don't have a saved plan. Use /plan first.")
+            return ConversationHandler.END
+        await update.message.reply_text("How would you like to improve your current plan? (e.g., make it easier, add more cardio)")
+        return IMPROVE_REQUEST
+
+    async def process_improvement(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        profile = UserProfileManager.get_user_profile(update.effective_user.id)
+        request = update.message.text
+        prompt = (
+            f"User profile: {json.dumps(profile)}\n\n"
+            f"Current plan: {profile.get('last_plan', '')}\n\n"
+            f"User wants to improve the plan as follows: {request}\n\n"
+            "Please provide an improved version of the plan only. Keep it under 200 words."
+        )
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are a fitness expert."},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            improved_plan = response["choices"][0]["message"]["content"]
+            UserProfileManager.save_user_plan(update.effective_user.id, improved_plan)
+            await update.message.reply_text(f"✅ Updated Plan:\n{improved_plan}")
+        except Exception as e:
+            await update.message.reply_text(f"Error improving plan: {str(e)}")
+        return ConversationHandler.END
+    
+
+    async def delete_plan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        profile = UserProfileManager.get_user_profile(update.effective_user.id)
+        if not profile or "last_plan" not in profile:
+            await update.message.reply_text("No saved plan found.")
+            return
+        UserProfileManager.delete_user_plan(update.effective_user.id)
+        await update.message.reply_text("✅ Your fitness plan has been deleted. Use /plan to create a new one.")
+
+    async def predict_entry(self, update, context):
+        profile = UserProfileManager.get_user_profile(update.effective_user.id)
+        if not profile:
+            await update.message.reply_text("You need a profile first. Use /start.")
+            return ConversationHandler.END
+        context.user_data["predict_profile"] = profile
+        await update.message.reply_text("How many sessions per week do you plan?")
+        return PREDICT_SESSIONS
+    
+    async def get_sessions(self, update, context):
+        context.user_data["sessions_per_week"] = int(update.message.text)
+        await update.message.reply_text("How many minutes is each session?")
+        return PREDICT_DURATION
+
+    async def get_duration(self, update, context):
+        context.user_data["session_duration_minutes"] = int(update.message.text)
+        await update.message.reply_text("How many hours do you sleep per day?")
+        return PREDICT_SLEEP
+
+    async def get_sleep(self, update, context):
+        context.user_data["sleep_hours"] = float(update.message.text)
+        await update.message.reply_text("Do you follow a diet? (yes/no)")
+        return PREDICT_DIET
+
+    async def get_diet(self, update, context):
+        context.user_data["diet_followed"] = update.message.text.lower() in ["yes", "y"]
+        await update.message.reply_text("Did you have breaks or restrictions? (yes/no)")
+        return PREDICT_BREAKS
+
+    async def get_breaks(self, update, context):
+        context.user_data["restrictions_or_breaks"] = update.message.text.lower() in ["yes", "y"]
+        await update.message.reply_text("How consistent are you? (0–100%)")
+        return PREDICT_CONSISTENCY
+
+    async def get_consistency(self, update, context):
+        context.user_data["consistency_percent"] = float(update.message.text)
+
+    # Сбор профиля
+        p = context.user_data["predict_profile"]
+        x = pd.DataFrame([{
+            "age": p["age"],
+            "weight_start": p["weight"],
+            "height": p["height"],
+            "gender": p["gender"],
+            "goal": p["fitness_goal"].strip().lower().replace(" ", "_"),
+            "level": p["fitness_level"],
+            "sessions_per_week": context.user_data["sessions_per_week"],
+            "session_duration_minutes": context.user_data["session_duration_minutes"],
+            "sleep_hours": context.user_data["sleep_hours"],
+            "diet_followed": context.user_data["diet_followed"],
+            "restrictions_or_breaks": context.user_data["restrictions_or_breaks"],
+            "consistency_percent": context.user_data["consistency_percent"]
+        }])
+        print("🚨 INPUT TO MODEL:", x.to_dict(orient="records")[0])
+        prediction = progress_model.predict(x)[0]
+        weeks, kg = round(prediction[0], 1), round(prediction[1], 1)
+
+        await update.message.reply_text(f"📊 Predicted time to goal: {weeks} weeks\n⚖️ Expected weight change: {kg} kg")
+        return ConversationHandler.END
+
+
+
+
+
+    
+
 
     async def finish_profile_creation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):        
         UserProfileManager.save_user_profile(update.effective_user.id, context.user_data)
@@ -173,7 +345,7 @@ class FitnessAssistantBot:
         return ConversationHandler.END
 
     async def cancel_profile_creation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Профиль не был сохранён. Введите /start, чтобы начать заново.")
+        await update.message.reply_text("Canceled conversation and profile creation.")
         return ConversationHandler.END
 
     def run(self):
