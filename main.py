@@ -8,36 +8,44 @@ import pandas as pd
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
                           ConversationHandler, filters, ContextTypes)
 from pymongo import MongoClient
-import signal
-import asyncio
-import threading
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-
-# Загрузка модели
 progress_model = joblib.load("progress_predictor_extended.pkl")
 load_dotenv()
 
-# Настройки OpenAI GPT
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MONGO_DB_URI = os.getenv("MONGO_DB_URI")
 
-# Этапы диалога
 (START, NAME, AGE, GENDER, WEIGHT, HEIGHT, FITNESS_GOAL, FITNESS_LEVEL, IMPROVE_REQUEST, EDIT_PLAN) = range(10)
 (PREDICT_SESSIONS, PREDICT_DURATION, PREDICT_SLEEP, PREDICT_DIET, PREDICT_BREAKS, PREDICT_CONSISTENCY) = range(100, 106)
 
 
 class UserProfileManager:
+    import logging
+    logger = logging.getLogger(__name__)
+
     client = MongoClient(MONGO_DB_URI)
     db = client['fitness_bot']
     collection = db['user_profiles']
 
     @classmethod
     def save_user_profile(cls, user_id, profile_data):
-        cls.collection.update_one(
+    # Убеждаемся, что user_id записан в профиль
+        profile_data["user_id"] = user_id
+
+        result = cls.collection.update_one(
             {"user_id": user_id},
             {"$set": profile_data},
             upsert=True
         )
+
+        if result.modified_count > 0 or result.upserted_id:
+            logger.info(f"[✅] Profile saved for user_id: {user_id}")
+        else:
+            logger.warning(f"[⚠️] Profile save attempted but no changes for user_id: {user_id}")
 
     @classmethod
     def get_user_profile(cls, user_id):
@@ -45,12 +53,18 @@ class UserProfileManager:
     
     @classmethod
     def save_user_plan(cls, user_id, plan):
-        cls.collection.update_one(
-            {"user_id": user_id},
-            {"$set": {"last_plan": plan}},
-            upsert=True
+        logger.info(f"[🔍] About to save plan:\n{plan[:100]}...") 
+        result = cls.collection.update_one(
+        {"user_id": user_id},
+        {"$set": {"last_plan": plan}},
+            upsert=False  
         )
-    
+
+        if result.modified_count > 0:
+            logger.info(f"[✅] Plan updated for user_id: {user_id}")
+        else:
+            logger.error(f"[❌] Plan NOT updated — user_id not found: {user_id}")
+
     @classmethod
     def delete_user_plan(cls, user_id):
         cls.collection.update_one(
@@ -88,37 +102,51 @@ class FitnessAssistantBot:
         conv_handler = ConversationHandler(
             entry_points=[CommandHandler('start', self.start_profile_creation)],
             states={
-                NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_name)],
-                AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_age)],
-                GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_gender)],
-                WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_weight)],
-                HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_height)],
-                FITNESS_GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_fitness_goal)],
-                FITNESS_LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_fitness_level)]
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_name)],
+            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_age)],
+            GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_gender)],
+            WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_weight)],
+            HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_height)],
+            FITNESS_GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_fitness_goal)],
+            FITNESS_LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.collect_fitness_level)],
             },
             fallbacks=[CommandHandler('cancel', self.cancel_profile_creation)]
-        )
+            )
+
         predict_conv = ConversationHandler(
-    entry_points=[CommandHandler("predict", self.predict_entry)],
-    states={
-        PREDICT_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_sessions)],
-        PREDICT_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_duration)],
-        PREDICT_SLEEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_sleep)],
-        PREDICT_DIET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_diet)],
-        PREDICT_BREAKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_breaks)],
-        PREDICT_CONSISTENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_consistency)],
-    },
-    fallbacks=[CommandHandler("cancel", self.cancel_profile_creation)],
-)
+            entry_points=[CommandHandler("predict", self.predict_entry)],
+            states={
+            PREDICT_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_sessions)],
+            PREDICT_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_duration)],
+            PREDICT_SLEEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_sleep)],
+            PREDICT_DIET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_diet)],
+            PREDICT_BREAKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_breaks)],
+            PREDICT_CONSISTENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_consistency)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel_profile_creation)]
+        )
+
+        improve_conv = ConversationHandler(
+            entry_points=[CommandHandler("improve", self.improve_plan)],
+            states={
+                IMPROVE_REQUEST: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_improvement)]
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel_profile_creation)]
+        )
+
         self.application.add_handler(predict_conv)
+        self.application.add_handler(improve_conv) 
         self.application.add_handler(conv_handler)
         self.application.add_handler(CommandHandler('profile', self.show_profile))
         self.application.add_handler(CommandHandler('plan', self.get_fitness_plan))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_ai_query))
-        self.application.add_handler(CommandHandler('improve', self.improve_plan))
         self.application.add_handler(CommandHandler('deleteplan', self.delete_plan))
-        conv_handler.states[IMPROVE_REQUEST] = [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_improvement)]
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.unknown_message))
+
+
         
+    async def unknown_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("❗ I didn't understand that. Please use commands like /start or /plan.")
+
 
 
     async def start_profile_creation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,7 +251,7 @@ class FitnessAssistantBot:
             return
         if "last_plan" in profile:
             await update.message.reply_text(
-                "You already have a fitness plan.\nUse /improve to enhance it or /resetplan to start over."
+                "You already have a fitness plan.\nUse /improve to enhance it or /deleteplan to start over."
             )
             return
         plan = self.ai_assistant.generate_fitness_plan(profile)
@@ -240,28 +268,37 @@ class FitnessAssistantBot:
         return IMPROVE_REQUEST
 
     async def process_improvement(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        profile = UserProfileManager.get_user_profile(update.effective_user.id)
-        request = update.message.text
-        prompt = (
+        try:
+            profile = UserProfileManager.get_user_profile(update.effective_user.id)
+            request = update.message.text
+            prompt = (
             f"User profile: {json.dumps(profile)}\n\n"
             f"Current plan: {profile.get('last_plan', '')}\n\n"
             f"User wants to improve the plan as follows: {request}\n\n"
             "Please provide an improved version of the plan only. Keep it under 200 words."
-        )
-        try:
+            )
+
             response = openai.ChatCompletion.create(
                 model="gpt-4o",
                 messages=[
-                    {"role": "system", "content": "You are a fitness expert."},
+                 {"role": "system", "content": "You are a fitness expert."},
                     {"role": "user", "content": prompt}
                 ]
             )
+           
+
             improved_plan = response["choices"][0]["message"]["content"]
+            
             UserProfileManager.save_user_plan(update.effective_user.id, improved_plan)
+            logger.info(f"[DEBUG] Plan updated for user {update.effective_user.id}")
+            logger.debug(f"[GPT response]: {response}")
             await update.message.reply_text(f"✅ Updated Plan:\n{improved_plan}")
+
         except Exception as e:
+            print(f"[ERROR] GPT or DB issue: {str(e)}")
             await update.message.reply_text(f"Error improving plan: {str(e)}")
         return ConversationHandler.END
+
     
 
     async def delete_plan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -325,7 +362,7 @@ class FitnessAssistantBot:
             "restrictions_or_breaks": context.user_data["restrictions_or_breaks"],
             "consistency_percent": context.user_data["consistency_percent"]
         }])
-        print("🚨 INPUT TO MODEL:", x.to_dict(orient="records")[0])
+        print("INPUT TO MODEL:", x.to_dict(orient="records")[0])
         prediction = progress_model.predict(x)[0]
         weeks, kg = round(prediction[0], 1), round(prediction[1], 1)
 

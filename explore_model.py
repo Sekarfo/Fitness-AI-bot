@@ -6,11 +6,11 @@ import matplotlib.pyplot as plt
 # Загрузка модели
 model = joblib.load("progress_predictor_extended.pkl")
 
-# Структура модели
+
 print("\n===== Pipeline Structure =====")
 print(model)
 
-# Доступ к регрессору (RandomForest внутри MultiOutputRegressor)
+
 regressor = model.named_steps["regressor"].estimators_[0]  # для weeks_to_goal
 feature_names = []
 
@@ -21,7 +21,7 @@ cat_features_raw = preprocessor.transformers_[1][2]
 cat_encoder = preprocessor.transformers_[1][1].named_steps["onehot"]
 cat_encoded = cat_encoder.get_feature_names_out(cat_features_raw)
 
-# Все признаки после трансформации
+
 feature_names = list(num_features) + list(cat_encoded)
 
 # Важность признаков
@@ -54,7 +54,7 @@ df = pd.read_csv("progress_dataset_extended.csv")
 X = df.drop(columns=["weeks_to_goal", "kg_change"])
 y = df[["weeks_to_goal", "kg_change"]]
 
-# Разделение для оценки
+
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
 # Предсказание
